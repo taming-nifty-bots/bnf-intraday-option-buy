@@ -28,7 +28,7 @@ slack_channel = "bankniftyoptionbuy"
 slack_client = WebClient(token=os.environ.get('slack_token'))
 CONNECTION_STRING = os.environ.get('CONNECTION_STRING') #Mongo Connection
 trade_end_time = parser.parse("15:28:00").time()
-trade_start_time = parser.parse("09:30:01").time()
+trade_start_time = parser.parse("09:20:01").time()
 
 mongo_client = MongoClient(CONNECTION_STRING)
 collection_name = "supertrend"
@@ -152,7 +152,7 @@ def main():
             # print(heiken3.iloc[-50:])
             high40 = df.iloc[-41:-2]['high'].max()
             low40 = df.iloc[-41:-2]['low'].min()
-            df = ta.rsi(df, period=34)
+            df = ta.rsi(df, period=40)
             print(f"40 period High: {high40}, Low: {low40}, RSI: {df.iloc[-1]['rsi']}")
 
             pcr_value = pcr(conn, atm=util.round_to_nearest(df.iloc[-1]['close'], base=100), multiple=100)

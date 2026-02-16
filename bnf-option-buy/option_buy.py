@@ -34,7 +34,7 @@ load_dotenv(dotenv_file)
 slack_channel = "bankniftyoptionbuy"
 CONNECTION_STRING = os.environ.get('CONNECTION_STRING')
 user_name = os.environ.get('user_name')
-trade_start_time = parser.parse("9:30:30").time()
+trade_start_time = parser.parse("9:20:30").time()
 trade_end_time = parser.parse("15:28:00").time()
 slack_client = WebClient(token=os.environ.get('slack_token'))
 quantity = os.environ.get('quantity')
@@ -479,10 +479,10 @@ def main():
                             return
 
                 elif strategies.count_documents({'entry_date': str(datetime.datetime.now().date())}) < max_trades:
-                    if get_color() == 'green' and get_instrument_close() > get_high40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=30, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_rsi() > 60:
+                    if get_color() == 'green' and get_instrument_close() > get_high40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_rsi() > 60:
                         print("Creating Bullish Position")
                         buy_call()
-                    elif get_color() == 'red' and get_instrument_close() < get_low40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=30, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_rsi() < 40:
+                    elif get_color() == 'red' and get_instrument_close() < get_low40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_rsi() < 40:
                         print("Creating Bearish Position")
                         buy_put()
                     else:
