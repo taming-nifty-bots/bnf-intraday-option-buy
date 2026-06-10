@@ -414,7 +414,7 @@ def main():
     print(f"{instrument_name} Option Buying bot kicked off")
     days_ago = datetime.datetime.now() - timedelta(days=7)
     start = days_ago.replace(hour=9, minute=15, second=0, microsecond=0)
-    trailing_sl = -750 * total_lots
+    trailing_sl = -1500 * total_lots
     
     # Track the time when the last notification was sent
     last_notification_time = datetime.datetime.now()
@@ -443,7 +443,7 @@ def main():
                         if strategy['max_pnl_reached'] < get_pnl(strategy, start):
                             max_pnl = get_pnl(strategy, start)                         
                             strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': max_pnl}})
-                            trailing_sl = (-750 * total_lots) + max_pnl
+                            trailing_sl = (-1500 * total_lots) + max_pnl
                         
                         if strategy['min_pnl_reached'] > get_pnl(strategy, start):
                             strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': get_pnl(strategy, start)}})
@@ -451,26 +451,26 @@ def main():
                         if get_pnl(strategy, start) <= trailing_sl:
                             util.notify(f"SL HIT! Current PnL: {strategy['running_pnl']}",slack_client=slack_client, slack_channel=slack_channel)
                             close_active_positions("SL HIT")
-                            trailing_sl = -750 * total_lots
+                            trailing_sl = -1500 * total_lots
                             break
 
-                        if get_pnl(strategy, start) >= 1500 * total_lots:
+                        if get_pnl(strategy, start) >= 2250 * total_lots:
                             util.notify(f"Target HIT! Current PnL: {strategy['running_pnl']}",slack_client=slack_client, slack_channel=slack_channel)
                             close_active_positions("Target HIT")
-                            trailing_sl = -750 * total_lots
+                            trailing_sl = -1500 * total_lots
                             break
                         
-                        if strategy['trend'] == "Bullish" and get_color() == 'red':
-                            util.notify(f"Brick changed to {get_color()}, 1 brick SL hit",slack_client=slack_client, slack_channel=slack_channel)
-                            close_active_positions("1 brick SL hit")
-                            trailing_sl = -750 * total_lots
-                            break
+                        # if strategy['trend'] == "Bullish" and get_color() == 'red':
+                        #     util.notify(f"Brick changed to {get_color()}, 1 brick SL hit",slack_client=slack_client, slack_channel=slack_channel)
+                        #     close_active_positions("1 brick SL hit")
+                        #     trailing_sl = -1500 * total_lots
+                        #     break
 
-                        if strategy['trend'] == "Bearish" and get_color() == 'green':
-                            util.notify(f"Brick changed to {get_color()}, 1 brick SL hit",slack_client=slack_client, slack_channel=slack_channel)
-                            close_active_positions("1 brick SL hit")
-                            trailing_sl = -750 * total_lots
-                            break
+                        # if strategy['trend'] == "Bearish" and get_color() == 'green':
+                        #     util.notify(f"Brick changed to {get_color()}, 1 brick SL hit",slack_client=slack_client, slack_channel=slack_channel)
+                        #     close_active_positions("1 brick SL hit")
+                        #     trailing_sl = -750 * total_lots
+                        #     break
 
                         print(str(datetime.datetime.now().date()))
                         if current_time >= datetime.time(hour=15, minute=25):
