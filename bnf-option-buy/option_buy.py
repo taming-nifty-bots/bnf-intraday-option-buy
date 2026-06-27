@@ -39,6 +39,7 @@ trade_end_time = parser.parse("15:28:00").time()
 slack_client = WebClient(token=os.environ.get('slack_token'))
 quantity = os.environ.get('quantity')
 instrument_name = os.environ.get('instrument_name')
+DAILY_MAX_LOSS_PER_LOT = -4000
 if instrument_name == "NIFTY":
     lot_size = 65
     padding = .01
@@ -286,6 +287,31 @@ def get_option_symbol(strike=19950, option_type = "PE" ):
     return df['TRADINGSYM'].values[0], df['EXPIRY'].values[0]
 
 
+def calculate_vix_risk_params(vix, option_cost):
+    VIX_ref = 15
+    min_rr = 1.0
+    max_rr = 3.0
+    vix_min = 10.0
+    vix_max = 30.0
+    rr = max(min_rr, min(max_rr, max_rr - (vix - vix_min) * (max_rr - min_rr) / (vix_max - vix_min)))
+
+    base_stop_loss = -1500 * total_lots
+    vix_multiplier = max(0.5, min(vix / VIX_ref, 2.0))
+    stop_loss = max(base_stop_loss * vix_multiplier, round(-0.5 * option_cost * int(quantity), 2))
+    min_sl_floor = -1000 * total_lots
+    stop_loss = min(stop_loss, min_sl_floor)
+    trailing_stop_loss = stop_loss
+    raw_target = abs(stop_loss) * rr
+    cost_based_target = round(2 * option_cost * int(quantity), 2)
+    target = min(raw_target, cost_based_target)
+    util.notify(
+        f"Risk params: VIX={round(float(vix), 2)}, RR={round(float(rr), 2)}, SL={round(float(stop_loss), 2)}, Target={round(float(target), 2)}",
+        slack_client=slack_client,
+        slack_channel=slack_channel
+    )
+    return stop_loss, trailing_stop_loss, target, rr
+
+
 
 def buy_put():
     option_type = "PE"
@@ -313,22 +339,7 @@ def buy_put():
 def record_details_in_mongo(buy_strike_symbol, trend, instrument_close, expiry, long_option_cost):
     conn = edge.login_to_integrate()
     vix = edge.fetch_ltp(conn, 'NSE', 'India VIX')
-    VIX_ref = 15
-    min_rr = 1.0
-    max_rr = 3.0
-    vix_min = 10.0
-    vix_max = 30.0
-    rr = max(min_rr, min(max_rr, max_rr - (vix - vix_min) * (max_rr - min_rr) / (vix_max - vix_min)))
-
-    base_stop_loss = -1500 * total_lots
-    vix_multiplier = max(0.5, min(vix / VIX_ref, 2.0))
-    stop_loss = max(base_stop_loss * vix_multiplier, round(-0.5 * long_option_cost * int(quantity), 2))
-    min_sl_floor = -1000 * total_lots
-    stop_loss = min(stop_loss, min_sl_floor)
-    trailing_stop_loss = stop_loss
-    raw_target = abs(stop_loss) * rr
-    cost_based_target = round(2 * long_option_cost * int(quantity), 2)
-    target = min(raw_target, cost_based_target)
+    stop_loss, trailing_stop_loss, target, rr = calculate_vix_risk_params(vix, long_option_cost)
 
     strategy = {
     'instrument_name': instrument_name,
@@ -439,6 +450,7 @@ def main():
     print(f"{instrument_name} Option Buying bot kicked off")
     days_ago = datetime.datetime.now() - timedelta(days=7)
     start = days_ago.replace(hour=9, minute=15, second=0, microsecond=0)
+    daily_max_loss_limit = DAILY_MAX_LOSS_PER_LOT * total_lots
     
     # Track the time when the last notification was sent
     last_notification_time = datetime.datetime.now()
@@ -505,6 +517,29 @@ def main():
                             return
 
                 elif strategies.count_documents({'entry_date': str(datetime.datetime.now().date())}) < max_trades:
+                    today = str(datetime.datetime.now().date())
+                    closed_strategies = strategies.find({'exit_date': today, 'strategy_state': 'closed'})
+                    realized_today = 0.0
+                    for strategy in closed_strategies:
+                        try:
+                            realized_today += float(strategy.get('net_pnl', 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+
+                    if realized_today <= daily_max_loss_limit:
+                        message = f"Daily kill switch active. Realized net PnL today: {realized_today}, limit: {daily_max_loss_limit}. Exiting bot for the day."
+                        print(message)
+                        util.notify(message, slack_client=slack_client, slack_channel=slack_channel)
+                        return
+
+                    # Keep projected-entry guard simple: use worst-case stop from current SL model.
+                    projected_stop_loss = -3000 * total_lots
+                    if (realized_today + projected_stop_loss) < daily_max_loss_limit:
+                        message = f"No further entries possible today. Realized today: {realized_today}, projected stop: {projected_stop_loss}, limit: {daily_max_loss_limit}. Exiting bot for the day."
+                        print(message)
+                        util.notify(message, slack_client=slack_client, slack_channel=slack_channel)
+                        return
+
                     if get_color() == 'green' and get_instrument_close() > get_high40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_pcr() < 0.8:
                         print("Creating Bullish Position")
                         buy_call()
