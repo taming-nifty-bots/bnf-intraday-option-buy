@@ -313,6 +313,23 @@ def buy_put():
 def record_details_in_mongo(buy_strike_symbol, trend, instrument_close, expiry, long_option_cost):
     conn = edge.login_to_integrate()
     vix = edge.fetch_ltp(conn, 'NSE', 'India VIX')
+    VIX_ref = 15
+    min_rr = 1.0
+    max_rr = 3.0
+    vix_min = 10.0
+    vix_max = 30.0
+    rr = max(min_rr, min(max_rr, max_rr - (vix - vix_min) * (max_rr - min_rr) / (vix_max - vix_min)))
+
+    base_stop_loss = -1500 * total_lots
+    vix_multiplier = max(0.5, min(vix / VIX_ref, 2.0))
+    stop_loss = max(base_stop_loss * vix_multiplier, round(-0.5 * long_option_cost * int(quantity), 2))
+    min_sl_floor = -1000 * total_lots
+    stop_loss = min(stop_loss, min_sl_floor)
+    trailing_stop_loss = stop_loss
+    raw_target = abs(stop_loss) * rr
+    cost_based_target = round(2 * long_option_cost * int(quantity), 2)
+    target = min(raw_target, cost_based_target)
+
     strategy = {
     'instrument_name': instrument_name,
     'India Vix': vix,
@@ -322,11 +339,18 @@ def record_details_in_mongo(buy_strike_symbol, trend, instrument_close, expiry, 
     'strategy_state': 'active',
     'entry_date': str(datetime.datetime.now().date()),
     'exit_date': '',
+    'entry_day_of_week': datetime.datetime.now().strftime('%A'),
+    'exit_day_of_week': '',
     'trend' : trend,
     'pcr' : get_pcr(),
     'rsi' : get_rsi(),
     'long_option_symbol' : buy_strike_symbol,
     'long_option_cost' : long_option_cost,
+    'stop_loss': stop_loss,
+    'trailing_stop_loss': trailing_stop_loss,
+    'target': target,
+    'rr': rr,
+    'total_investment': round(long_option_cost * int(quantity), 2),
     'entry_time' : datetime.datetime.now().strftime('%H:%M'),
     'exit_time' : '',
     'instrument_close' : round(instrument_close,2),
@@ -382,6 +406,7 @@ def close_active_positions(reason, ltp=None):
         strategies.update_one({'_id': strategy['_id']}, {'$set': {'strategy_state': 'closed'}})
         strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_date': str(datetime.datetime.now().date())}})
         strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_time': datetime.datetime.now().strftime('%H:%M')}})
+        strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_day_of_week': datetime.datetime.now().strftime('%A')}})
         #strategies.update_one({'_id': strategy['_id']}, {'$set': {'long_exit_price': sell_order['average_traded_price']}})
         strategies.update_one({'_id': strategy['_id']}, {'$set': {'long_exit_price': ltp if ltp else sell_order['average_traded_price']}})
         strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_reason': reason}})
@@ -414,7 +439,6 @@ def main():
     print(f"{instrument_name} Option Buying bot kicked off")
     days_ago = datetime.datetime.now() - timedelta(days=7)
     start = days_ago.replace(hour=9, minute=15, second=0, microsecond=0)
-    trailing_sl = -1500 * total_lots
     
     # Track the time when the last notification was sent
     last_notification_time = datetime.datetime.now()
@@ -440,24 +464,25 @@ def main():
                     active_strategies = strategies.find(
                         {'strategy_state': 'active'})
                     for strategy in active_strategies:
-                        if strategy['max_pnl_reached'] < get_pnl(strategy, start):
-                            max_pnl = get_pnl(strategy, start)                         
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': max_pnl}})
-                            trailing_sl = (-1500 * total_lots) + max_pnl
+                        pnl = get_pnl(strategy, start)
+                        trailing_stop_loss = strategy['trailing_stop_loss']
+                        if strategy['max_pnl_reached'] < pnl:
+                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': pnl}})
+                            trailing_stop_loss = strategy['stop_loss'] + pnl
+                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'trailing_stop_loss': trailing_stop_loss}})
+                            util.notify(f"New Max PnL reached: {pnl}, Updated Trailing SL: {trailing_stop_loss}",slack_client=slack_client, slack_channel=slack_channel)
                         
-                        if strategy['min_pnl_reached'] > get_pnl(strategy, start):
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': get_pnl(strategy, start)}})
+                        if strategy['min_pnl_reached'] > pnl:
+                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': pnl}})
 
-                        if get_pnl(strategy, start) <= trailing_sl:
-                            util.notify(f"SL HIT! Current PnL: {strategy['running_pnl']}",slack_client=slack_client, slack_channel=slack_channel)
+                        if pnl <= trailing_stop_loss:
+                            util.notify(f"SL HIT! Current PnL: {pnl}",slack_client=slack_client, slack_channel=slack_channel)
                             close_active_positions("SL HIT")
-                            trailing_sl = -1500 * total_lots
                             break
 
-                        if get_pnl(strategy, start) >= 2250 * total_lots:
-                            util.notify(f"Target HIT! Current PnL: {strategy['running_pnl']}",slack_client=slack_client, slack_channel=slack_channel)
+                        if pnl >= strategy['target']:
+                            util.notify(f"Target HIT! Current PnL: {pnl}",slack_client=slack_client, slack_channel=slack_channel)
                             close_active_positions("Target HIT")
-                            trailing_sl = -1500 * total_lots
                             break
                         
                         # if strategy['trend'] == "Bullish" and get_color() == 'red':
@@ -488,8 +513,6 @@ def main():
                         buy_put()
                     else:
                         print("waiting for entry Signal to create new positions!")
-                elif max_trades < 3:
-                    print(f"Trade Limit hit for {instrument_name} , waiting limit revival")
                 else:
                     util.notify(f" MAX Trade Limit hit for {instrument_name} , exit", slack_client=slack_client, slack_channel=slack_channel)
                     return
