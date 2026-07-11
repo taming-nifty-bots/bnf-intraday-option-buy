@@ -39,7 +39,11 @@ trade_end_time = parser.parse("15:28:00").time()
 slack_client = WebClient(token=os.environ.get('slack_token'))
 quantity = os.environ.get('quantity')
 instrument_name = os.environ.get('instrument_name')
-DAILY_MAX_LOSS_PER_LOT = -4000
+DAILY_MAX_LOSS_PER_LOT = -1200   # daily loss CEILING per lot ~= 2% of ~Rs.60k/lot capital (Rs.1.2L for 2 lots). Applied x total_lots ONLY (never x max_trades): a ceiling must not scale with trade count.
+# --- Fixed-stop winner design (validated 2yr backtest); replaces the old VIX-scaled SL/RR ---
+STOP_LOSS_PER_LOT = 750       # flat rupee stop per lot (no VIX scaling)
+REWARD_RISK_RATIO = 3.0       # target = REWARD_RISK_RATIO * |stop|, capped at 2x premium (validated)
+HALF_BOOK_AT_R = 0.25         # book HALF the position at +0.25R, then move the runner stop to breakeven
 if instrument_name == "NIFTY":
     lot_size = 65
     padding = .01
@@ -47,7 +51,13 @@ elif instrument_name == "BANKNIFTY":
     lot_size = 30
     padding = .01
 
-total_lots = int(quantity) / lot_size
+total_lots = int(quantity) // lot_size
+# Partial booking splits the position into two equal halves, so an EVEN lot count is required.
+if int(quantity) % lot_size != 0 or total_lots < 2 or total_lots % 2 != 0:
+    print(f"[config] quantity={quantity} resolves to {total_lots} lot(s) of {lot_size}; "
+          f"this strategy books half the position and needs an EVEN lot count (>= 2). Exiting.")
+    raise SystemExit(1)
+half_quantity = (total_lots // 2) * lot_size   # lot-aligned half booked at +0.25R
 
 mongo_client = MongoClient(CONNECTION_STRING)
 
@@ -287,30 +297,6 @@ def get_option_symbol(strike=19950, option_type = "PE" ):
     return df['TRADINGSYM'].values[0], df['EXPIRY'].values[0]
 
 
-def calculate_vix_risk_params(vix, option_cost):
-    VIX_ref = 15
-    min_rr = 1.0
-    max_rr = 3.0
-    vix_min = 10.0
-    vix_max = 30.0
-    rr = max(min_rr, min(max_rr, max_rr - (vix - vix_min) * (max_rr - min_rr) / (vix_max - vix_min)))
-
-    base_stop_loss = -1500 * total_lots
-    vix_multiplier = max(0.5, min(vix / VIX_ref, 2.0))
-    stop_loss = max(base_stop_loss * vix_multiplier, round(-0.5 * option_cost * int(quantity), 2))
-    min_sl_floor = -1000 * total_lots
-    stop_loss = min(stop_loss, min_sl_floor)
-    trailing_stop_loss = stop_loss
-    raw_target = abs(stop_loss) * rr
-    cost_based_target = round(2 * option_cost * int(quantity), 2)
-    target = min(raw_target, cost_based_target)
-    util.notify(
-        f"Risk params: VIX={round(float(vix), 2)}, RR={round(float(rr), 2)}, SL={round(float(stop_loss), 2)}, Target={round(float(target), 2)}",
-        slack_client=slack_client,
-        slack_channel=slack_channel
-    )
-    return stop_loss, trailing_stop_loss, target, rr
-
 
 
 def buy_put():
@@ -338,8 +324,20 @@ def buy_put():
 
 def record_details_in_mongo(buy_strike_symbol, trend, instrument_close, expiry, long_option_cost):
     conn = edge.login_to_integrate()
-    vix = edge.fetch_ltp(conn, 'NSE', 'India VIX')
-    stop_loss, trailing_stop_loss, target, rr = calculate_vix_risk_params(vix, long_option_cost)
+    vix = edge.fetch_ltp(conn, 'NSE', 'India VIX')  # logged for analysis only (no longer drives the SL)
+
+    # Fixed-stop winner design (inlined; no VIX scaling). Both premium-relative guards removed after
+    # validation — the premium floor and the 2x-premium target cap each bound 0/352 in the 2yr
+    # backtest, and a long option can't lose more than its premium anyway. stop/target are now pure
+    # hardcoded functions of the constants:
+    stop_loss = -STOP_LOSS_PER_LOT * total_lots
+    target = round(abs(stop_loss) * REWARD_RISK_RATIO, 2)
+    half_book_trigger = round(HALF_BOOK_AT_R * abs(stop_loss), 2)
+    util.notify(
+        f"Risk (fixed): SL={round(stop_loss, 2)}, Target={target}, RR={REWARD_RISK_RATIO}, "
+        f"HalfBook>= {half_book_trigger} ({HALF_BOOK_AT_R}R)",
+        slack_client=slack_client, slack_channel=slack_channel
+    )
 
     strategy = {
     'instrument_name': instrument_name,
@@ -358,9 +356,17 @@ def record_details_in_mongo(buy_strike_symbol, trend, instrument_close, expiry, 
     'long_option_symbol' : buy_strike_symbol,
     'long_option_cost' : long_option_cost,
     'stop_loss': stop_loss,
-    'trailing_stop_loss': trailing_stop_loss,
     'target': target,
-    'rr': rr,
+    'rr': REWARD_RISK_RATIO,
+    # --- half-booking tracking (book half at +0.25R, then run the remainder to breakeven) ---
+    'half_book_at_r': HALF_BOOK_AT_R,
+    'half_book_trigger': half_book_trigger,
+    'half_booked': False,
+    'half_booked_pnl': 0,
+    'half_book_price': 0,
+    'half_book_time': '',
+    'half_book_date': '',
+    'runner_quantity': int(quantity),
     'total_investment': round(long_option_cost * int(quantity), 2),
     'entry_time' : datetime.datetime.now().strftime('%H:%M'),
     'exit_time' : '',
@@ -410,37 +416,63 @@ def calculate_pnl(quantity, entry, exit):
 def close_active_positions(reason, ltp=None):
     print(f"Closing active positions {instrument_name}")
     util.notify(f"Closing active positions {instrument_name}",slack_client=slack_client, slack_channel=slack_channel)
-    active_strategies = strategies.find({'strategy_state': 'active'})
+    active_strategies = strategies.find({'strategy_state': {'$in': ['active', 'partial']}})
     for strategy in active_strategies:
-        sell_order = place_sell_order(strategy['long_option_symbol'], strategy['quantity'])
+        runner_quantity = int(strategy.get('runner_quantity', strategy['quantity']))
+        sell_order = place_sell_order(strategy['long_option_symbol'], runner_quantity)
         util.notify("Long option leg closed",slack_client=slack_client, slack_channel=slack_channel)
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'strategy_state': 'closed'}})
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_date': str(datetime.datetime.now().date())}})
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_time': datetime.datetime.now().strftime('%H:%M')}})
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_day_of_week': datetime.datetime.now().strftime('%A')}})
-        #strategies.update_one({'_id': strategy['_id']}, {'$set': {'long_exit_price': sell_order['average_traded_price']}})
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'long_exit_price': ltp if ltp else sell_order['average_traded_price']}})
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'exit_reason': reason}})
+        exit_price = ltp if ltp else sell_order['average_traded_price']
+        half_booked_pnl = float(strategy.get('half_booked_pnl', 0) or 0)
+        runner_pnl = calculate_pnl(runner_quantity, strategy['long_option_cost'], exit_price)
+        gross_pnl = round(half_booked_pnl + runner_pnl, 2)
+        net_pnl = round(gross_pnl - (105 * total_lots), 2)  # Deducting brokerage and taxes (flat, conservative)
         update_last_exit_time()
-        pnl = calculate_pnl(strategy['quantity'], strategy['long_option_cost'], ltp if ltp else sell_order['average_traded_price'])
-        util.notify(f"Realized Gains: {round(pnl, 2)}",slack_client=slack_client, slack_channel=slack_channel)
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'pnl': pnl}})
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {'net_pnl': (pnl-(105*total_lots))}})  # Deducting brokerage and taxes
-        util.notify(f"Net PnL after brokerage and taxes: {round((pnl-(105*total_lots)), 2)}",slack_client=slack_client, slack_channel=slack_channel)
-        print(f"Realized Gains: {round(pnl, 2)}")
-        print(f"Net PnL after brokerage and taxes: {round((pnl-(105*total_lots)), 2)}")
+        strategies.update_one({'_id': strategy['_id']}, {'$set': {
+            'strategy_state': 'closed',
+            'exit_date': str(datetime.datetime.now().date()),
+            'exit_time': datetime.datetime.now().strftime('%H:%M'),
+            'exit_day_of_week': datetime.datetime.now().strftime('%A'),
+            'long_exit_price': exit_price,
+            'exit_reason': reason,
+            'pnl': gross_pnl,
+            'net_pnl': net_pnl,
+        }})
+        util.notify(f"Exit [{reason}] half={half_booked_pnl} runner={runner_pnl} gross={gross_pnl} net={net_pnl}",slack_client=slack_client, slack_channel=slack_channel)
+        print(f"Exit [{reason}] gross={gross_pnl} net={net_pnl}")
         time.sleep(10)  # Wait for 10 seconds before looking for next entry signal
     return
 
 @retry(tries=5, delay=5, backoff=2)
-def get_pnl(strategy, start=None):
+def get_current_price(strategy, start=None):
     if start is None:
         days_ago = datetime.datetime.now() - timedelta(days=7)
         start = days_ago.replace(hour=9, minute=15, second=0, microsecond=0)
-    long_option_cost = edge.get_option_price('NFO', strategy['long_option_symbol'], start, datetime.datetime.today(), 'min')
-    current_pnl = calculate_pnl(strategy['quantity'], strategy['long_option_cost'], long_option_cost)
-    strategies.update_one({'_id': strategy['_id']}, {'$set': {'running_pnl': current_pnl}})
-    return current_pnl
+    return edge.get_option_price('NFO', strategy['long_option_symbol'], start, datetime.datetime.today(), 'min')
+
+
+@retry(tries=5, delay=5, backoff=2)
+def book_half(strategy, option_price=None):
+    """Book the lot-aligned half of the position at >= +0.25R; the runner then sits at breakeven (cost).
+    Records the half-book leg so the DB tracks partial-exit -> full-exit for the trade."""
+    full_quantity = int(strategy['quantity'])
+    sell_order = place_sell_order(strategy['long_option_symbol'], half_quantity)
+    half_book_price = option_price if option_price else sell_order['average_traded_price']
+    half_booked_pnl = calculate_pnl(half_quantity, strategy['long_option_cost'], half_book_price)
+    runner_quantity = full_quantity - half_quantity
+    strategies.update_one({'_id': strategy['_id']}, {'$set': {
+        'half_booked': True,
+        'strategy_state': 'partial',
+        'half_booked_pnl': round(half_booked_pnl, 2),
+        'half_book_price': half_book_price,
+        'half_book_time': datetime.datetime.now().strftime('%H:%M'),
+        'half_book_date': str(datetime.datetime.now().date()),
+        'runner_quantity': runner_quantity,
+    }})
+    util.notify(f"HALF BOOK: sold {half_quantity} @ {half_book_price}, half_booked_pnl={round(half_booked_pnl, 2)}; "
+                f"runner {runner_quantity} now at breakeven (cost {strategy['long_option_cost']})",
+                slack_client=slack_client, slack_channel=slack_channel)
+    print(f"HALF BOOK {half_quantity}@{half_book_price} half_booked_pnl={round(half_booked_pnl, 2)} runner={runner_quantity}")
+    return
 
 
 
@@ -450,11 +482,12 @@ def main():
     print(f"{instrument_name} Option Buying bot kicked off")
     days_ago = datetime.datetime.now() - timedelta(days=7)
     start = days_ago.replace(hour=9, minute=15, second=0, microsecond=0)
-    daily_max_loss_limit = DAILY_MAX_LOSS_PER_LOT * total_lots
+    max_trades = 2  # Winner design uses 2 trades/day (was 3). Revert to 3 to loosen.
+    daily_max_loss_limit = DAILY_MAX_LOSS_PER_LOT * total_lots  # Daily loss ceiling (2% of capital). CEILING, not a per-trade allowance -> x total_lots only, NEVER x max_trades. Both the kill switch and the re-entry guard check against this.
     
     # Track the time when the last notification was sent
     last_notification_time = datetime.datetime.now()
-    max_trades = 3  # Set the maximum number of trades allowed per day
+
     while True:
         try:
             current_time = datetime.datetime.now().time()
@@ -472,49 +505,56 @@ def main():
             print(f"current time: {current_time}")
             if current_time > trade_start_time:
                 print("Trading Window is active.")
-                if strategies.count_documents({'strategy_state': 'active'}) > 0:
+                if strategies.count_documents({'strategy_state': {'$in': ['active', 'partial']}}) > 0:
                     active_strategies = strategies.find(
-                        {'strategy_state': 'active'})
+                        {'strategy_state': {'$in': ['active', 'partial']}})
                     for strategy in active_strategies:
-                        pnl = get_pnl(strategy, start)
-                        trailing_stop_loss = strategy['trailing_stop_loss']
-                        if strategy['max_pnl_reached'] < pnl:
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': pnl}})
-                            trailing_stop_loss = strategy['stop_loss'] + pnl
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'trailing_stop_loss': trailing_stop_loss}})
-                            util.notify(f"New Max PnL reached: {pnl}, Updated Trailing SL: {trailing_stop_loss}",slack_client=slack_client, slack_channel=slack_channel)
-                        
-                        if strategy['min_pnl_reached'] > pnl:
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': pnl}})
+                        option_price = get_current_price(strategy, start)
+                        option_cost = float(strategy['long_option_cost'])
+                        full_quantity = int(strategy['quantity'])
 
-                        if pnl <= trailing_stop_loss:
-                            util.notify(f"SL HIT! Current PnL: {pnl}",slack_client=slack_client, slack_channel=slack_channel)
-                            close_active_positions("SL HIT")
-                            break
+                        if not strategy.get('half_booked', False):
+                            # ---- Phase 1: full position on a fixed stop; book half at +0.25R ----
+                            position_pnl = calculate_pnl(full_quantity, option_cost, option_price)
+                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'running_pnl': position_pnl}})
+                            if position_pnl > float(strategy.get('max_pnl_reached', 0) or 0):
+                                strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': position_pnl}})
+                            if position_pnl < float(strategy.get('min_pnl_reached', 0) or 0):
+                                strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': position_pnl}})
 
-                        if pnl >= strategy['target']:
-                            util.notify(f"Target HIT! Current PnL: {pnl}",slack_client=slack_client, slack_channel=slack_channel)
-                            close_active_positions("Target HIT")
-                            break
-                        
-                        # if strategy['trend'] == "Bullish" and get_color() == 'red':
-                        #     util.notify(f"Brick changed to {get_color()}, 1 brick SL hit",slack_client=slack_client, slack_channel=slack_channel)
-                        #     close_active_positions("1 brick SL hit")
-                        #     trailing_sl = -1500 * total_lots
-                        #     break
+                            if position_pnl <= strategy['stop_loss']:
+                                util.notify(f"SL HIT! Current PnL: {position_pnl}",slack_client=slack_client, slack_channel=slack_channel)
+                                close_active_positions("SL HIT")
+                                break
+                            elif position_pnl >= strategy['half_book_trigger']:
+                                util.notify(f"Half-book level reached ({strategy.get('half_book_at_r', HALF_BOOK_AT_R)}R). PnL: {position_pnl}",slack_client=slack_client, slack_channel=slack_channel)
+                                book_half(strategy)
+                            elif current_time >= datetime.time(hour=15, minute=25):
+                                util.notify("Time Based SL HIT! Closing positions",slack_client=slack_client, slack_channel=slack_channel)
+                                close_active_positions("Time Based SL HIT")
+                                util.notify(f"Time based SL Hit for {instrument_name} today, waiting for next trading day",slack_client=slack_client, slack_channel=slack_channel)
+                                return
+                        else:
+                            # ---- Phase 2: runner (half), stop at breakeven, target unchanged ----
+                            runner_quantity = int(strategy['runner_quantity'])
+                            runner_pnl = calculate_pnl(runner_quantity, option_cost, option_price)
+                            half_booked_pnl = float(strategy.get('half_booked_pnl', 0) or 0)
+                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'running_pnl': round(half_booked_pnl + runner_pnl, 2)}})
+                            runner_target_price = option_cost + float(strategy['target']) / full_quantity
 
-                        # if strategy['trend'] == "Bearish" and get_color() == 'green':
-                        #     util.notify(f"Brick changed to {get_color()}, 1 brick SL hit",slack_client=slack_client, slack_channel=slack_channel)
-                        #     close_active_positions("1 brick SL hit")
-                        #     trailing_sl = -750 * total_lots
-                        #     break
-
-                        print(str(datetime.datetime.now().date()))
-                        if current_time >= datetime.time(hour=15, minute=25):
-                            util.notify("Time Based SL HIT! Closing positions",slack_client=slack_client, slack_channel=slack_channel)
-                            close_active_positions("Time Based SL HIT")
-                            util.notify(f"Time based SL Hit for {instrument_name} today, waiting for next trading day",slack_client=slack_client, slack_channel=slack_channel)
-                            return
+                            if option_price <= option_cost:
+                                util.notify(f"Runner breakeven stop hit @ {option_price} (cost {option_cost}). Booking remainder.",slack_client=slack_client, slack_channel=slack_channel)
+                                close_active_positions("Partial+BE")
+                                break
+                            elif option_price >= runner_target_price:
+                                util.notify(f"Runner TARGET hit @ {option_price} (>= {round(runner_target_price, 2)}).",slack_client=slack_client, slack_channel=slack_channel)
+                                close_active_positions("Partial+Target")
+                                break
+                            elif current_time >= datetime.time(hour=15, minute=25):
+                                util.notify("Time exit on runner. Closing remainder.",slack_client=slack_client, slack_channel=slack_channel)
+                                close_active_positions("Partial+Time")
+                                util.notify(f"Time based exit for {instrument_name} today, waiting for next trading day",slack_client=slack_client, slack_channel=slack_channel)
+                                return
 
                 elif strategies.count_documents({'entry_date': str(datetime.datetime.now().date())}) < max_trades:
                     today = str(datetime.datetime.now().date())
@@ -532,8 +572,8 @@ def main():
                         util.notify(message, slack_client=slack_client, slack_channel=slack_channel)
                         return
 
-                    # Keep projected-entry guard simple: use worst-case stop from current SL model.
-                    projected_stop_loss = -3000 * total_lots
+                    # Keep projected-entry guard simple: worst-case = fixed stop from the current SL model.
+                    projected_stop_loss = -STOP_LOSS_PER_LOT * total_lots
                     if (realized_today + projected_stop_loss) < daily_max_loss_limit:
                         message = f"No further entries possible today. Realized today: {realized_today}, projected stop: {projected_stop_loss}, limit: {daily_max_loss_limit}. Exiting bot for the day."
                         print(message)
