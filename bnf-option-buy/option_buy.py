@@ -412,6 +412,18 @@ def calculate_pnl(quantity, entry, exit):
     return round(pnl, 2)
 
 
+def update_pnl_extremes(strategy, current_pnl):
+    current_pnl = round(float(current_pnl), 2)
+    prev_max = float(strategy.get('max_pnl_reached', 0) or 0)
+    prev_min = float(strategy.get('min_pnl_reached', 0) or 0)
+    updates = {'running_pnl': current_pnl}
+    if current_pnl > prev_max:
+        updates['max_pnl_reached'] = current_pnl
+    if current_pnl < prev_min:
+        updates['min_pnl_reached'] = current_pnl
+    strategies.update_one({'_id': strategy['_id']}, {'$set': updates})
+
+
 @retry(tries=5, delay=5, backoff=2)
 def close_active_positions(reason, ltp=None):
     print(f"Closing active positions {instrument_name}")
@@ -426,6 +438,8 @@ def close_active_positions(reason, ltp=None):
         runner_pnl = calculate_pnl(runner_quantity, strategy['long_option_cost'], exit_price)
         gross_pnl = round(half_booked_pnl + runner_pnl, 2)
         net_pnl = round(gross_pnl - (105 * total_lots), 2)  # Deducting brokerage and taxes (flat, conservative)
+        prev_max = float(strategy.get('max_pnl_reached', 0) or 0)
+        prev_min = float(strategy.get('min_pnl_reached', 0) or 0)
         update_last_exit_time()
         strategies.update_one({'_id': strategy['_id']}, {'$set': {
             'strategy_state': 'closed',
@@ -434,8 +448,11 @@ def close_active_positions(reason, ltp=None):
             'exit_day_of_week': datetime.datetime.now().strftime('%A'),
             'long_exit_price': exit_price,
             'exit_reason': reason,
+            'running_pnl': gross_pnl,
             'pnl': gross_pnl,
             'net_pnl': net_pnl,
+            'max_pnl_reached': max(prev_max, gross_pnl),
+            'min_pnl_reached': min(prev_min, gross_pnl),
         }})
         util.notify(f"Exit [{reason}] half={half_booked_pnl} runner={runner_pnl} gross={gross_pnl} net={net_pnl}",slack_client=slack_client, slack_channel=slack_channel)
         print(f"Exit [{reason}] gross={gross_pnl} net={net_pnl}")
@@ -516,11 +533,7 @@ def main():
                         if not strategy.get('half_booked', False):
                             # ---- Phase 1: full position on a fixed stop; book half at +0.25R ----
                             position_pnl = calculate_pnl(full_quantity, option_cost, option_price)
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'running_pnl': position_pnl}})
-                            if position_pnl > float(strategy.get('max_pnl_reached', 0) or 0):
-                                strategies.update_one({'_id': strategy['_id']}, {'$set': {'max_pnl_reached': position_pnl}})
-                            if position_pnl < float(strategy.get('min_pnl_reached', 0) or 0):
-                                strategies.update_one({'_id': strategy['_id']}, {'$set': {'min_pnl_reached': position_pnl}})
+                            update_pnl_extremes(strategy, position_pnl)
 
                             if position_pnl <= strategy['stop_loss']:
                                 util.notify(f"SL HIT! Current PnL: {position_pnl}",slack_client=slack_client, slack_channel=slack_channel)
@@ -539,7 +552,8 @@ def main():
                             runner_quantity = int(strategy['runner_quantity'])
                             runner_pnl = calculate_pnl(runner_quantity, option_cost, option_price)
                             half_booked_pnl = float(strategy.get('half_booked_pnl', 0) or 0)
-                            strategies.update_one({'_id': strategy['_id']}, {'$set': {'running_pnl': round(half_booked_pnl + runner_pnl, 2)}})
+                            position_pnl = round(half_booked_pnl + runner_pnl, 2)
+                            update_pnl_extremes(strategy, position_pnl)
                             runner_target_price = option_cost + float(strategy['target']) / full_quantity
 
                             if option_price <= option_cost:
