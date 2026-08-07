@@ -150,8 +150,8 @@ def main():
             print(df.iloc[-20:])
             
             # print(heiken3.iloc[-50:])
-            high40 = df.iloc[-41:-2]['high'].max()
-            low40 = df.iloc[-41:-2]['low'].min()
+            high40 = df.iloc[-41:-1]['high'].max()
+            low40 = df.iloc[-41:-1]['low'].min()
             df = ta.rsi(df, period=40)
             print(f"40 period High: {high40}, Low: {low40}, RSI: {df.iloc[-1]['rsi']}")
 
