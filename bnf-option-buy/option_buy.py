@@ -608,10 +608,10 @@ def main():
                         util.notify(message, slack_client=slack_client, slack_channel=slack_channel)
                         return
 
-                    if get_color() == 'green' and get_instrument_close() > get_high40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_pcr() < 0.8:
+                    if get_color() == 'green' and get_instrument_close() > get_high40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time(): #and get_pcr() < 0.8:
                         print("Creating Bullish Position")
                         buy_call()
-                    elif get_color() == 'red' and get_instrument_close() < get_low40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time() and get_pcr() > 1.2:
+                    elif get_color() == 'red' and get_instrument_close() < get_low40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time(): #and get_pcr() > 1.2:
                         print("Creating Bearish Position")
                         buy_put()
                     else:
