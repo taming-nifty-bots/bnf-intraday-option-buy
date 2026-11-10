@@ -2,6 +2,7 @@ import os
 from tamingnifty import connect_definedge as edge
 from tamingnifty import utils as util
 from tamingnifty import ta
+from tamingnifty.safety import check_trading_day
 from datetime import datetime, timedelta
 from dateutil import parser
 import pandas as pd
@@ -128,8 +129,17 @@ def camarilla_levels(conn, trading_symbol):
         return {}
 
 
+def notify(message):
+    try:
+        util.notify(message=message, slack_client=slack_client, slack_channel=slack_channel)
+    except Exception as error:
+        print("Slack notification failed: " + util.exception_detail(error), flush=True)
+
+
 #@retry(tries=5, delay=5, backoff=2)
 def main():
+    if not check_trading_day(mongo_client, notify):
+        return
     print("Supertrend Started")
     util.notify(message="Bank Nifty Supertrend bot has started!", slack_client=slack_client, slack_channel=slack_channel)
     # Track the time when the last notification was sent

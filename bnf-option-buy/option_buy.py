@@ -2,6 +2,7 @@ from pymongo import MongoClient
 import os
 from tamingnifty import connect_definedge as edge
 from tamingnifty import utils as util
+from tamingnifty.safety import assert_execution_clear, check_trading_day, guarded_execution
 import requests
 import time
 import zipfile
@@ -63,6 +64,7 @@ mongo_client = MongoClient(CONNECTION_STRING)
 
 strategies_collection_name = instrument_name.lower() + "_" + user_name
 orders_collection_name = "orders_" + instrument_name.lower() + "_" + user_name
+EXECUTION_SCOPE = "Bots." + strategies_collection_name
 
 # trades collection
 strategies = mongo_client['Bots'][strategies_collection_name]
@@ -138,10 +140,11 @@ def get_last_exit_time():
 @retry(tries=5, delay=5, backoff=2)
 def update_last_exit_time():
     #
-    supertrend_collection.update_one({"_id": instrument_name}, {"$set": {"lastexittime": get_close_time()}})
+    check_write(supertrend_collection.update_one(
+        {"_id": instrument_name}, {"$set": {"lastexittime": get_close_time()}}),
+        "last exit marker", require_match=True)
     return
 
-@retry(tries=5, delay=5, backoff=2)
 def place_buy_order(symbol, qty):
     # conn = edge.login_to_integrate(True)
     # io = edge.IntegrateOrders(conn)
@@ -192,11 +195,10 @@ def place_buy_order(symbol, qty):
     }
     print(f"Order placed: {order}")
     util.notify(f"Order placed: {order}",slack_client=slack_client, slack_channel=slack_channel)
-    orders.insert_one(order)
+    check_write(orders.insert_one(order), "buy order")
     return order
 
 
-@retry(tries=5, delay=5, backoff=2)
 def place_sell_order(symbol, qty):
     # conn = edge.login_to_integrate(True)
     # io = edge.IntegrateOrders(conn)
@@ -246,7 +248,7 @@ def place_sell_order(symbol, qty):
         "ordersource": "TRTP"
     }
     util.notify(f"Order placed: {order}",slack_client=slack_client, slack_channel=slack_channel)
-    orders.insert_one(order)
+    check_write(orders.insert_one(order), "sell order")
     return order
 
 
@@ -393,7 +395,7 @@ def record_details_in_mongo(buy_strike_symbol, trend, instrument_close, expiry, 
     # Observational fields only - appended after the dict is built so they can
     # never interfere with any risk value above.
     strategy.update(get_camarilla_context())
-    strategies.insert_one(strategy)
+    check_write(strategies.insert_one(strategy), "new strategy")
 
 
 
@@ -438,7 +440,6 @@ def update_pnl_extremes(strategy, current_pnl):
     strategies.update_one({'_id': strategy['_id']}, {'$set': updates})
 
 
-@retry(tries=5, delay=5, backoff=2)
 def close_active_positions(reason, ltp=None):
     print(f"Closing active positions {instrument_name}")
     util.notify(f"Closing active positions {instrument_name}",slack_client=slack_client, slack_channel=slack_channel)
@@ -455,7 +456,7 @@ def close_active_positions(reason, ltp=None):
         prev_max = float(strategy.get('max_pnl_reached', 0) or 0)
         prev_min = float(strategy.get('min_pnl_reached', 0) or 0)
         update_last_exit_time()
-        strategies.update_one({'_id': strategy['_id']}, {'$set': {
+        check_write(strategies.update_one({'_id': strategy['_id']}, {'$set': {
             'strategy_state': 'closed',
             'exit_date': str(datetime.datetime.now().date()),
             'exit_time': datetime.datetime.now().strftime('%H:%M'),
@@ -467,7 +468,7 @@ def close_active_positions(reason, ltp=None):
             'net_pnl': net_pnl,
             'max_pnl_reached': max(prev_max, gross_pnl),
             'min_pnl_reached': min(prev_min, gross_pnl),
-        }})
+        }}), "closed strategy", require_match=True)
         util.notify(f"Exit [{reason}] half={half_booked_pnl} runner={runner_pnl} gross={gross_pnl} net={net_pnl}",slack_client=slack_client, slack_channel=slack_channel)
         print(f"Exit [{reason}] gross={gross_pnl} net={net_pnl}")
         time.sleep(10)  # Wait for 10 seconds before looking for next entry signal
@@ -481,7 +482,6 @@ def get_current_price(strategy, start=None):
     return edge.get_option_price('NFO', strategy['long_option_symbol'], start, datetime.datetime.today(), 'min')
 
 
-@retry(tries=5, delay=5, backoff=2)
 def book_half(strategy, option_price=None):
     """Book the lot-aligned half of the position at >= +0.25R; the runner then sits at breakeven (cost).
     Records the half-book leg so the DB tracks partial-exit -> full-exit for the trade."""
@@ -490,7 +490,7 @@ def book_half(strategy, option_price=None):
     half_book_price = option_price if option_price else sell_order['average_traded_price']
     half_booked_pnl = calculate_pnl(half_quantity, strategy['long_option_cost'], half_book_price)
     runner_quantity = full_quantity - half_quantity
-    strategies.update_one({'_id': strategy['_id']}, {'$set': {
+    check_write(strategies.update_one({'_id': strategy['_id']}, {'$set': {
         'half_booked': True,
         'strategy_state': 'partial',
         'half_booked_pnl': round(half_booked_pnl, 2),
@@ -498,7 +498,7 @@ def book_half(strategy, option_price=None):
         'half_book_time': datetime.datetime.now().strftime('%H:%M'),
         'half_book_date': str(datetime.datetime.now().date()),
         'runner_quantity': runner_quantity,
-    }})
+    }}), "half-booked strategy", require_match=True)
     util.notify(f"HALF BOOK: sold {half_quantity} @ {half_book_price}, half_booked_pnl={round(half_booked_pnl, 2)}; "
                 f"runner {runner_quantity} now at breakeven (cost {strategy['long_option_cost']})",
                 slack_client=slack_client, slack_channel=slack_channel)
@@ -507,8 +507,27 @@ def book_half(strategy, option_price=None):
 
 
 
+def check_write(result, action, require_match=False):
+    if not result.acknowledged or (require_match and result.matched_count != 1):
+        raise RuntimeError("Unconfirmed Mongo persistence: " + action)
+
+
+def run_execution(action, function, *args):
+    return guarded_execution(mongo_client, EXECUTION_SCOPE, notify, action, function, *args)
+
+
+def notify(message):
+    try:
+        util.notify(message=message, slack_client=slack_client, slack_channel=slack_channel)
+    except Exception as error:
+        print("Slack notification failed: " + util.exception_detail(error), flush=True)
+
+
 # @retry(tries=5, delay=5, backoff=2)
 def main():
+    if not check_trading_day(mongo_client, notify):
+        return
+    assert_execution_clear(mongo_client, EXECUTION_SCOPE, notify)
     util.notify(f"{instrument_name} Option Buying bot kicked off",slack_client=slack_client, slack_channel=slack_channel)
     print(f"{instrument_name} Option Buying bot kicked off")
     days_ago = datetime.datetime.now() - timedelta(days=7)
@@ -551,14 +570,14 @@ def main():
 
                             if position_pnl <= strategy['stop_loss']:
                                 util.notify(f"SL HIT! Current PnL: {position_pnl}",slack_client=slack_client, slack_channel=slack_channel)
-                                close_active_positions("SL HIT")
+                                run_execution("SL HIT", close_active_positions, "SL HIT")
                                 break
                             elif position_pnl >= strategy['half_book_trigger']:
                                 util.notify(f"Half-book level reached ({strategy.get('half_book_at_r', HALF_BOOK_AT_R)}R). PnL: {position_pnl}",slack_client=slack_client, slack_channel=slack_channel)
-                                book_half(strategy)
+                                run_execution("half book", book_half, strategy)
                             elif current_time >= datetime.time(hour=15, minute=25):
                                 util.notify("Time Based SL HIT! Closing positions",slack_client=slack_client, slack_channel=slack_channel)
-                                close_active_positions("Time Based SL HIT")
+                                run_execution("time exit", close_active_positions, "Time Based SL HIT")
                                 util.notify(f"Time based SL Hit for {instrument_name} today, waiting for next trading day",slack_client=slack_client, slack_channel=slack_channel)
                                 return
                         else:
@@ -572,15 +591,15 @@ def main():
 
                             if option_price <= option_cost:
                                 util.notify(f"Runner breakeven stop hit @ {option_price} (cost {option_cost}). Booking remainder.",slack_client=slack_client, slack_channel=slack_channel)
-                                close_active_positions("Partial+BE")
+                                run_execution("runner breakeven", close_active_positions, "Partial+BE")
                                 break
                             elif option_price >= runner_target_price:
                                 util.notify(f"Runner TARGET hit @ {option_price} (>= {round(runner_target_price, 2)}).",slack_client=slack_client, slack_channel=slack_channel)
-                                close_active_positions("Partial+Target")
+                                run_execution("runner target", close_active_positions, "Partial+Target")
                                 break
                             elif current_time >= datetime.time(hour=15, minute=25):
                                 util.notify("Time exit on runner. Closing remainder.",slack_client=slack_client, slack_channel=slack_channel)
-                                close_active_positions("Partial+Time")
+                                run_execution("runner time exit", close_active_positions, "Partial+Time")
                                 util.notify(f"Time based exit for {instrument_name} today, waiting for next trading day",slack_client=slack_client, slack_channel=slack_channel)
                                 return
 
@@ -610,10 +629,10 @@ def main():
 
                     if get_color() == 'green' and get_instrument_close() > get_high40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time(): #and get_pcr() < 0.8:
                         print("Creating Bullish Position")
-                        buy_call()
+                        run_execution("entry CE", buy_call)
                     elif get_color() == 'red' and get_instrument_close() < get_low40() and current_time < datetime.time(hour=15, minute=5) and get_close_time() > datetime.datetime.now().replace(hour=9, minute=20, second=0, microsecond=0) and get_close_time() > get_last_exit_time(): #and get_pcr() > 1.2:
                         print("Creating Bearish Position")
-                        buy_put()
+                        run_execution("entry PE", buy_put)
                     else:
                         print("waiting for entry Signal to create new positions!")
                 else:
